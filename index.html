@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>视频教程生成器</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #ffffff;
+    --primary: #4f46e5;
+    --primary-light: #6366f1;
+    --text: #1e293b;
+    --muted: #64748b;
+    --border: #e2e8f0;
+    --ok: #10b981;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", -apple-system, sans-serif;
+    background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
+    min-height: 100vh;
+    color: var(--text);
+    padding: 24px 16px 60px;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+  header { text-align: center; margin-bottom: 28px; color: #fff; }
+  header h1 { font-size: 28px; letter-spacing: 1px; }
+  header p { color: #a5b4fc; margin-top: 8px; font-size: 14px; }
+  .card {
+    background: var(--card);
+    border-radius: 16px;
+    padding: 24px;
+    box-shadow: 0 10px 40px rgba(0,0,0,.35);
+    margin-bottom: 20px;
+  }
+  .input-row { display: flex; gap: 10px; }
+  .input-row input {
+    flex: 1;
+    padding: 13px 16px;
+    border: 2px solid var(--border);
+    border-radius: 10px;
+    font-size: 15px;
+    outline: none;
+    transition: border-color .2s;
+  }
+  .input-row input:focus { border-color: var(--primary-light); }
+  button {
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    font-size: 15px;
+    font-weight: 600;
+    padding: 13px 22px;
+    transition: all .2s;
+    white-space: nowrap;
+  }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-primary:hover { background: var(--primary-light); }
+  .btn-primary:disabled { background: #94a3b8; cursor: not-allowed; }
+  .btn-ghost { background: #f1f5f9; color: var(--text); padding: 8px 14px; font-size: 13px; }
+  .btn-ghost:hover { background: #e2e8f0; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 10px; }
+
+  /* 进度 */
+  .progress-wrap { display: none; }
+  .progress-bar { height: 10px; background: #f1f5f9; border-radius: 99px; overflow: hidden; }
+  .progress-fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--primary), #8b5cf6);
+    border-radius: 99px; transition: width .4s ease;
+  }
+  .progress-info { display: flex; justify-content: space-between; margin-top: 8px; font-size: 13px; color: var(--muted); }
+  .stage-badge {
+    display: inline-block; background: #eef2ff; color: var(--primary);
+    border-radius: 99px; padding: 3px 12px; font-size: 12px; font-weight: 600;
+  }
+
+  /* 结果 */
+  .result-wrap { display: none; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; align-items: center; }
+  .toolbar .title { font-size: 16px; font-weight: 700; margin-right: auto; }
+  .tabs { display: flex; gap: 4px; background: #f1f5f9; border-radius: 10px; padding: 4px; margin-bottom: 16px; }
+  .tab {
+    padding: 8px 18px; border-radius: 8px; font-size: 14px; cursor: pointer;
+    color: var(--muted); transition: all .2s; border: none; background: transparent;
+  }
+  .tab.active { background: #fff; color: var(--primary); font-weight: 600; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* Markdown 渲染样式 */
+  .md { line-height: 1.8; font-size: 15px; }
+  .md h1 { font-size: 24px; margin: 20px 0 12px; padding-bottom: 8px; border-bottom: 2px solid var(--border); }
+  .md h2 { font-size: 20px; margin: 22px 0 10px; color: var(--primary); }
+  .md h3 { font-size: 17px; margin: 18px 0 8px; }
+  .md p { margin: 10px 0; }
+  .md ul, .md ol { margin: 10px 0 10px 24px; }
+  .md li { margin: 6px 0; }
+  .md blockquote {
+    border-left: 4px solid var(--primary); background: #f8fafc;
+    padding: 10px 16px; margin: 12px 0; border-radius: 0 8px 8px 0; color: #475569;
+  }
+  .md code { background: #f1f5f9; padding: 2px 6px; border-radius: 5px; font-size: 13px; }
+  .md pre { background: #0f172a; color: #e2e8f0; padding: 14px; border-radius: 10px; overflow-x: auto; margin: 12px 0; }
+  .md pre code { background: transparent; padding: 0; }
+  .md hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+  .md strong { font-weight: 700; color: #0f172a; }
+  .md a { color: var(--primary); }
+  .transcript-panel {
+    white-space: pre-wrap; word-break: break-all; font-size: 13px; line-height: 1.8;
+    color: #475569; max-height: 640px; overflow-y: auto; background: #f8fafc;
+    border-radius: 10px; padding: 16px;
+  }
+  footer { text-align: center; color: #64748b; font-size: 12px; margin-top: 30px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>🎬 视频教程生成器</h1>
+    <p>输入视频链接 → 自动转录 → AI 生成学习教程</p>
+  </header>
+
+  <div class="card">
+    <div class="input-row">
+      <input id="urlInput" type="text" placeholder="粘贴 B站 / YouTube 视频链接…"
+             value="https://www.bilibili.com/video/BV1CfHM6nEtA/">
+      <button id="btnGenerate" class="btn-primary" onclick="startGenerate()">生成教程</button>
+    </div>
+    <div class="hint">支持 yt-dlp 支持的站点；音频将下载后按 2 分钟切分转录，再由 LLM 提炼成教程</div>
+  </div>
+
+  <div class="card progress-wrap" id="progressCard">
+    <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+      <span class="stage-badge" id="stageBadge">排队中</span>
+      <span id="progressMsg" style="font-size:13px; color:var(--muted);">任务已创建</span>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="progress-info"><span id="progressPct">0%</span><span id="progressStageText"></span></div>
+  </div>
+
+  <div class="card result-wrap" id="resultCard">
+    <div class="toolbar">
+      <span class="title" id="resultTitle">教程</span>
+      <button class="btn-ghost" onclick="copyMarkdown()">复制 Markdown</button>
+      <button class="btn-ghost" onclick="downloadMarkdown()">下载 .md</button>
+    </div>
+    <div class="tabs">
+      <button class="tab active" data-tab="tutorial" onclick="switchTab('tutorial')">📖 学习教程</button>
+      <button class="tab" data-tab="transcript" onclick="switchTab('transcript')">📝 原文转录</button>
+    </div>
+    <div class="panel active" id="panelTutorial"><div class="md" id="tutorialMd"></div></div>
+    <div class="panel" id="panelTranscript"><div class="transcript-panel" id="transcriptText"></div></div>
+  </div>
+
+  <footer>后端: server.py · 转录: MOSS-Transcribe-Diarize · LLM: spark-x2.6</footer>
+</div>
+
+<script>
+let pollTimer = null;
+let currentTask = null;
+
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+// 轻量 Markdown -> HTML 渲染
+function renderMd(md) {
+  let lines = md.replace(/\r\n/g,'\n').split('\n');
+  let html = [], inUl = false, inOl = false, inBq = false, inPre = false;
+  const inline = s => esc(s)
+    .replace(/!\[(.*?)\]\((.*?)\)/g, '<img alt="$1" src="$2">')
+    .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>');
+  const closeLists = () => { if (inUl) { html.push('</ul>'); inUl = false; } if (inOl) { html.push('</ol>'); inOl = false; } };
+  const closeBq = () => { if (inBq) { html.push('</blockquote>'); inBq = false; } };
+  for (let raw of lines) {
+    const line = raw;
+    if (inPre) {
+      if (/^```/.test(line)) { html.push('</code></pre>'); inPre = false; }
+      else html.push(esc(line));
+      continue;
+    }
+    if (/^```/.test(line)) { closeLists(); closeBq(); html.push('<pre><code>'); inPre = true; continue; }
+    if (/^\s*$/.test(line)) { closeLists(); closeBq(); continue; }
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { closeLists(); closeBq(); const lv = h[1].length; html.push(`<h${lv}>${inline(h[2])}</h${lv}>`); continue; }
+    if (/^(---|\*\*\*|___)\s*$/.test(line)) { closeLists(); closeBq(); html.push('<hr>'); continue; }
+    if (/^>\s?/.test(line)) { closeLists(); if (!inBq) { html.push('<blockquote>'); inBq = true; } html.push(`<p>${inline(line.replace(/^>\s?/,''))}</p>`); continue; }
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (ul) { if (inOl) { html.push('</ol>'); inOl = false; } if (!inUl) { html.push('<ul>'); inUl = true; } html.push(`<li>${inline(ul[1])}</li>`); continue; }
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ol) { if (inUl) { html.push('</ul>'); inUl = false; } if (!inOl) { html.push('<ol>'); inOl = true; } html.push(`<li>${inline(ol[1])}</li>`); continue; }
+    closeLists(); closeBq();
+    html.push(`<p>${inline(line)}</p>`);
+  }
+  closeLists(); closeBq();
+  if (inPre) html.push('</code></pre>');
+  return html.join('\n');
+}
+
+function startGenerate() {
+  const url = document.getElementById('urlInput').value.trim();
+  if (!/^https?:\/\//.test(url)) { alert('请输入 http/https 开头的链接'); return; }
+  const btn = document.getElementById('btnGenerate');
+  btn.disabled = true; btn.textContent = '生成中…';
+  document.getElementById('progressCard').style.display = 'block';
+  document.getElementById('resultCard').style.display = 'none';
+  document.getElementById('progressFill').style.width = '0%';
+  document.getElementById('progressPct').textContent = '0%';
+  document.getElementById('stageBadge').textContent = '排队中';
+  document.getElementById('progressMsg').textContent = '任务已创建…';
+  document.getElementById('progressStageText').textContent = '';
+
+  fetch('/api/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url })
+  })
+  .then(r => r.json())
+  .then(d => {
+    if (d.task_id) { currentTask = d.task_id; poll(0); }
+  })
+  .catch(e => { alert('请求失败: ' + e.message); btn.disabled = false; btn.textContent = '生成教程'; });
+}
+
+function poll(tries) {
+  if (!currentTask) return;
+  fetch('/api/status/' + currentTask)
+    .then(r => r.json())
+    .then(t => {
+      document.getElementById('progressFill').style.width = (t.progress || 0) + '%';
+      document.getElementById('progressPct').textContent = (t.progress || 0) + '%';
+      document.getElementById('stageBadge').textContent = t.stage || '';
+      document.getElementById('progressMsg').textContent = t.message || '';
+      if (t.status === 'done') {
+        clearTimeout(pollTimer);
+        showResult(t);
+        const btn = document.getElementById('btnGenerate');
+        btn.disabled = false; btn.textContent = '再生成一个';
+      } else if (t.status === 'error') {
+        clearTimeout(pollTimer);
+        alert('生成失败: ' + (t.error || '未知错误'));
+        const btn = document.getElementById('btnGenerate');
+        btn.disabled = false; btn.textContent = '生成教程';
+      } else if (tries < 600) {
+        pollTimer = setTimeout(() => poll(tries + 1), 3000);
+      }
+    })
+    .catch(() => { if (tries < 600) pollTimer = setTimeout(() => poll(tries + 1), 5000); });
+}
+
+function showResult(t) {
+  document.getElementById('progressCard').style.display = 'none';
+  document.getElementById('resultCard').style.display = 'block';
+  document.getElementById('resultTitle').textContent = (t.title || '视频') + ' 学习教程';
+  document.getElementById('tutorialMd').innerHTML = renderMd(t.markdown || '');
+  document.getElementById('transcriptText').textContent = t.transcript || '';
+  document.getElementById('resultCard').scrollIntoView({ behavior: 'smooth' });
+}
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
+  document.getElementById('panelTutorial').classList.toggle('active', tab === 'tutorial');
+  document.getElementById('panelTranscript').classList.toggle('active', tab === 'transcript');
+}
+
+function copyMarkdown() {
+  navigator.clipboard.writeText(document.getElementById('tutorialMd').innerText)
+    .then(() => { const b = event.target; b.textContent = '已复制 ✓'; setTimeout(() => b.textContent = '复制 Markdown', 1500); });
+}
+
+function downloadMarkdown() {
+  const blob = new Blob([document.getElementById('tutorialMd').innerText], { type: 'text/markdown' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (document.getElementById('resultTitle').textContent || 'tutorial') + '.md';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+</script>
+</body>
+</html>
