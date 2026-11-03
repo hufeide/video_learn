@@ -61,6 +61,18 @@
   .btn-ghost { background: #f1f5f9; color: var(--text); padding: 8px 14px; font-size: 13px; }
   .btn-ghost:hover { background: #e2e8f0; }
   .hint { font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .prompt-row { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+  .prompt-row label { font-size: 13px; font-weight: 600; color: var(--text); }
+  .prompt-row select {
+    padding: 8px 12px; border: 2px solid var(--border); border-radius: 8px;
+    font-size: 13px; outline: none; background: #fff; cursor: pointer;
+  }
+  .prompt-row select:focus { border-color: var(--primary-light); }
+  .prompt-preview {
+    margin-top: 10px; font-size: 12px; line-height: 1.7; color: #475569;
+    background: #f8fafc; border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; max-height: 200px; overflow-y: auto; white-space: pre-wrap;
+  }
 
   /* 进度 */
   .progress-wrap { display: none; }
@@ -112,6 +124,19 @@
     color: #475569; max-height: 640px; overflow-y: auto; background: #f8fafc;
     border-radius: 10px; padding: 16px;
   }
+  .files-box { display: none; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .files-box.show { display: flex; }
+  .file-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: #f1f5f9; border-radius: 99px; padding: 6px 8px 6px 14px;
+    font-size: 12px; color: #475569; max-width: 100%;
+  }
+  .file-chip .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 380px; }
+  .file-chip a {
+    background: var(--primary); color: #fff; border-radius: 99px;
+    padding: 4px 12px; text-decoration: none; font-size: 12px; font-weight: 600;
+    flex-shrink: 0;
+  }
   footer { text-align: center; color: #64748b; font-size: 12px; margin-top: 30px; }
 </style>
 </head>
@@ -128,7 +153,12 @@
              value="https://www.bilibili.com/video/BV1CfHM6nEtA/">
       <button id="btnGenerate" class="btn-primary" onclick="startGenerate()">生成教程</button>
     </div>
-    <div class="hint">支持 yt-dlp 支持的站点；音频将下载后按 2 分钟切分转录，再由 LLM 提炼成教程</div>
+    <div class="prompt-row">
+      <label for="promptSelect">提示词</label>
+      <select id="promptSelect" onchange="loadPromptPreview()"></select>
+      <span class="hint" style="margin:0">选择教程生成规则（同一网址的转录只做一次，之后可反复重新生成教程）</span>
+    </div>
+    <pre id="promptPreview" class="prompt-preview" style="display:none"></pre>
   </div>
 
   <div class="card progress-wrap" id="progressCard">
@@ -143,9 +173,11 @@
   <div class="card result-wrap" id="resultCard">
     <div class="toolbar">
       <span class="title" id="resultTitle">教程</span>
+      <button class="btn-ghost" onclick="exportZip()">⬇️ 导出全部 (zip)</button>
+      <button class="btn-ghost" id="btnRegen" onclick="regenerateTutorial()">重新生成教程</button>
       <button class="btn-ghost" onclick="copyMarkdown()">复制 Markdown</button>
-      <button class="btn-ghost" onclick="downloadMarkdown()">下载 .md</button>
     </div>
+    <div id="filesBox" class="files-box"></div>
     <div class="tabs">
       <button class="tab active" data-tab="tutorial" onclick="switchTab('tutorial')">📖 学习教程</button>
       <button class="tab" data-tab="transcript" onclick="switchTab('transcript')">📝 原文转录</button>
@@ -160,6 +192,40 @@
 <script>
 let pollTimer = null;
 let currentTask = null;
+
+// 加载提示词列表
+function loadPrompts() {
+  fetch('/api/prompts')
+    .then(r => r.json())
+    .then(d => {
+      const sel = document.getElementById('promptSelect');
+      sel.innerHTML = '';
+      (d.prompts || []).forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p; opt.textContent = p;
+        if (p === d.default) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      loadPromptPreview();
+    })
+    .catch(() => {});
+}
+
+// 预览当前选中的提示词内容
+function loadPromptPreview() {
+  const name = document.getElementById('promptSelect').value;
+  if (!name) return;
+  fetch('/prompt_files/' + encodeURIComponent(name))
+    .then(r => r.ok ? r.text() : Promise.reject(new Error('加载失败')))
+    .then(txt => {
+      const el = document.getElementById('promptPreview');
+      el.style.display = 'block';
+      el.textContent = txt;
+    })
+    .catch(() => { document.getElementById('promptPreview').style.display = 'none'; });
+}
+
+window.addEventListener('DOMContentLoaded', loadPrompts);
 
 function esc(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -204,6 +270,7 @@ function renderMd(md) {
 function startGenerate() {
   const url = document.getElementById('urlInput').value.trim();
   if (!/^https?:\/\//.test(url)) { alert('请输入 http/https 开头的链接'); return; }
+  const prompt = document.getElementById('promptSelect').value || 'video_prompt_0.md';
   const btn = document.getElementById('btnGenerate');
   btn.disabled = true; btn.textContent = '生成中…';
   document.getElementById('progressCard').style.display = 'block';
@@ -217,13 +284,36 @@ function startGenerate() {
   fetch('/api/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url })
+    body: JSON.stringify({ url, prompt })
   })
   .then(r => r.json())
   .then(d => {
     if (d.task_id) { currentTask = d.task_id; poll(0); }
   })
   .catch(e => { alert('请求失败: ' + e.message); btn.disabled = false; btn.textContent = '生成教程'; });
+}
+
+// 阶段二: 用已有转录生成教程 (复用 transcript, 只调用 LLM)
+function regenerateTutorial() {
+  if (!currentTask) return;
+  const prompt = document.getElementById('promptSelect').value || 'video_prompt_0.md';
+  const btn = document.getElementById('btnRegen');
+  btn.disabled = true; btn.textContent = '生成中…';
+  document.getElementById('progressCard').style.display = 'block';
+  document.getElementById('resultCard').style.display = 'none';
+  document.getElementById('progressFill').style.width = '0%';
+  document.getElementById('progressPct').textContent = '0%';
+  document.getElementById('stageBadge').textContent = '排队中';
+  document.getElementById('progressMsg').textContent = '正在生成教程…';
+
+  fetch('/api/regenerate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ task_id: currentTask, prompt })
+  })
+  .then(r => r.json())
+  .then(d => { if (d.task_id) { currentTask = d.task_id; poll(0); } })
+  .catch(e => { alert('请求失败: ' + e.message); btn.disabled = false; btn.textContent = '继续生成教程'; });
 }
 
 function poll(tries) {
@@ -235,7 +325,7 @@ function poll(tries) {
       document.getElementById('progressPct').textContent = (t.progress || 0) + '%';
       document.getElementById('stageBadge').textContent = t.stage || '';
       document.getElementById('progressMsg').textContent = t.message || '';
-      if (t.status === 'done') {
+      if (t.status === 'done' || t.status === 'transcript_ready') {
         clearTimeout(pollTimer);
         showResult(t);
         const btn = document.getElementById('btnGenerate');
@@ -255,10 +345,53 @@ function poll(tries) {
 function showResult(t) {
   document.getElementById('progressCard').style.display = 'none';
   document.getElementById('resultCard').style.display = 'block';
+  const ready = t.status === 'transcript_ready';
   document.getElementById('resultTitle').textContent = (t.title || '视频') + ' 学习教程';
-  document.getElementById('tutorialMd').innerHTML = renderMd(t.markdown || '');
+  document.getElementById('tutorialMd').innerHTML = ready
+    ? '<p style="color:var(--muted)">教程尚未生成。转录已完成，确认「原文转录」无误后，点击上方「继续生成教程」按钮。</p>'
+    : renderMd(t.markdown || '');
   document.getElementById('transcriptText').textContent = t.transcript || '';
+  document.getElementById('btnRegen').disabled = false;
+  document.getElementById('btnRegen').textContent = ready ? '继续生成教程' : '重新生成教程';
+  loadFilesBox(t);
+  if (ready) switchTab('transcript');  // 转录完成, 先展示原文
   document.getElementById('resultCard').scrollIntoView({ behavior: 'smooth' });
+}
+
+// 渲染任务下可导出的文件 (mp3 / transcript / tutorial)
+function loadFilesBox(t) {
+  const box = document.getElementById('filesBox');
+  box.innerHTML = '';
+  fetch('/api/files/' + encodeURIComponent(currentTask))
+    .then(r => r.json())
+    .then(d => {
+      const files = d.files || [];
+      if (!files.length) return;
+      files.forEach(f => {
+        const chip = document.createElement('span');
+        chip.className = 'file-chip';
+        const icon = f.name.endsWith('.mp3') ? '🎵' : (f.name.endsWith('.md') ? '📖' : '📝');
+        const label = f.name.replace(/^.*?(?=\.[^.]+$)/, '') || f.name;
+        const a = document.createElement('a');
+        a.href = '/api/download/' + encodeURIComponent(currentTask) + '/' + encodeURIComponent(f.name);
+        a.textContent = '下载';
+        const name = document.createElement('span');
+        name.className = 'fname';
+        name.textContent = icon + ' ' + f.name;
+        name.title = f.name + ' (' + Math.round(f.size / 1024) + ' KB)';
+        chip.appendChild(name);
+        chip.appendChild(a);
+        box.appendChild(chip);
+      });
+      box.classList.add('show');
+    })
+    .catch(() => {});
+}
+
+// 一键导出 zip
+function exportZip() {
+  if (!currentTask) return;
+  location.href = '/api/export/' + encodeURIComponent(currentTask);
 }
 
 function switchTab(tab) {

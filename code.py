@@ -45,7 +45,7 @@ curl http://localhost:9005/v1/audio/transcriptions \
 
 
 
-# 将音频按每段 600 秒（10 分钟）切分，输出到 /tmp/ 目录
+# 将音频按每段 120 秒（2 分钟）切分，输出到 /tmp/ 目录
 ffmpeg -i /mnt/e/mp3/特朗普为何“大撒币”？中期选举究竟有多重要？【现实版纸牌屋】.mp3 -f segment -segment_time 120 -c copy /home/administator/workspace/mp3/data_tlp/audio_part_%03d.mp3
 
 for f in /home/administator/workspace/mp3/data_tlp/audio_part_*.mp3; do
@@ -58,3 +58,7 @@ for f in /home/administator/workspace/mp3/data_tlp/audio_part_*.mp3; do
 done
 
 cat /home/administator/workspace/mp3/data_tlp/audio_part_*.mp3.json | jq -r '.text' > /home/administator/workspace/mp3/full_transcript.txt
+
+
+
+cd /home/administator/workspace/mp3 && python3 sf_extract.py "https://www.bilibili.com/video/BV1CfHM6nEtA/?trackid=web_pegasus_0.router-web-pegasus-2479516-f6fct.1793629822559.372&spm_id_from=333.1007.tianma.15-2-56.click&vd_source=8a84b55c5821166c6c762cd90b1b5772" ./test_out 2>&1 | tail -15

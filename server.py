@@ -3,42 +3,62 @@
 """
 视频教程生成器后端
 
-流程: 输入视频网址
-      → yt-dlp 下载音频 (MP3)
-      → ffmpeg 按 120 秒切分
-      → 本地 MOSS-Transcribe-Diarize (localhost:9005) 逐段转录
-      → 拼接完整转录文本
-      → 调用 spark-x2.6 LLM (按 vedio_prompt.md 规则) 生成学习教程 Markdown
+流程 (两阶段):
+    阶段一: 输入视频网址
+            → yt-dlp 下载音频 (MP3)
+            → ffmpeg 按 120 秒切分
+            → 本地 MOSS-Transcribe-Diarize (localhost:9005) 逐段转录
+            → 保存 transcript.txt, 暂停并展示给用户确认
+    阶段二: 用户点击「继续生成教程」
+            → 调用 spark-x2.6 LLM (按提示词文件规则) 生成学习教程 Markdown
 
-用法:
-    python3 server.py [--host 0.0.0.0] [--port 8000]
+缓存策略:
+    - task_id 由视频网址唯一确定 (md5 哈希), 同一网址 = 同一任务
+    - 若该任务下 transcript 已存在, 阶段一直接跳过下载/切分/转录, 暂停等待确认
+    - 若 tutorial 已存在且使用的提示词相同, 阶段二直接返回已有教程
+    - /api/regenerate 用于阶段二: 只生成教程, 不重新转录
+
+产物命名 (位于 work/{task_id}/ 下):
+    - {mp3基名}.mp3            音频 (保留)
+    - {mp3基名}.transcript.txt 转录文本
+    - {mp3基名}.tutorial.md    学习教程
+
+导出:
+    - GET /api/files/{task_id}         列出可导出文件
+    - GET /api/download/{task_id}/{name} 下载单个文件
+    - GET /api/export/{task_id}        一键打包 zip 导出
 
 接口:
     GET  /                     前端页面
-    POST /api/generate         {"url": "..."}  -> {"task_id": "..."}
+    GET  /api/prompts          可选提示词文件列表
+    POST /api/generate         {"url": "...", "prompt": "..."}  阶段一: 转录
+    POST /api/regenerate       {"task_id": "...", "prompt": "..."}  阶段二: 生成教程
     GET  /api/status/{task_id} 轮询进度与结果
+
+用法:
+    python3 server.py [--host 0.0.0.0] [--port 8000]
 """
 
 import argparse
-import json
+import hashlib
+import io
 import os
 import shutil
 import subprocess
 import threading
-import time
-import uuid
+import zipfile
 from pathlib import Path
 
 import requests
 import yt_dlp
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = BASE_DIR / "work"
-PROMPT_FILE = BASE_DIR / "vedio_prompt.md"
+DEFAULT_PROMPT = "video_prompt_0.md"
 
 # 从 .env 读取配置（环境变量优先于 .env）
 load_dotenv(BASE_DIR / ".env")
@@ -69,6 +89,54 @@ def update_task(task_id, **kw):
     with TASKS_LOCK:
         if task_id in TASKS:
             TASKS[task_id].update(kw)
+
+
+def make_task_id(url):
+    """由视频网址生成唯一 task_id (md5 前 12 位)"""
+    return hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
+
+
+def list_prompt_files():
+    """列出 BASE_DIR 下所有可用的 .md 提示词文件"""
+    return sorted(p.name for p in BASE_DIR.glob("*.md"))
+
+
+def resolve_prompt(name):
+    """解析提示词文件名 → 绝对路径; 非法或不存在则回退到默认"""
+    name = (name or "").strip() or DEFAULT_PROMPT
+    p = (BASE_DIR / name).resolve()
+    # 防止路径穿越
+    if not str(p).startswith(str(BASE_DIR)) or p.suffix != ".md" or not p.exists():
+        return BASE_DIR / DEFAULT_PROMPT
+    return p
+
+
+def find_transcript(work):
+    """查找已有转录文件 (兼容新旧命名)"""
+    for p in sorted(work.glob("*.transcript.txt")):
+        return p
+    old = work / "transcript.txt"
+    return old if old.exists() else None
+
+
+def find_tutorial(work):
+    """查找已有教程文件 (兼容新旧命名)"""
+    for p in sorted(work.glob("*.tutorial.md")):
+        return p
+    old = work / "tutorial.md"
+    return old if old.exists() else None
+
+
+def find_mp3(work):
+    """查找任务目录下的 mp3 文件"""
+    for p in sorted(work.glob("*.mp3")):
+        return p
+    return None
+
+
+def load_title(work):
+    tp = work / "title.txt"
+    return tp.read_text(encoding="utf-8").strip() if tp.exists() else ""
 
 
 def llm_chat(messages, temperature=0.3, max_tokens=8192, timeout=180):
@@ -185,9 +253,10 @@ def transcribe_all(parts, progress_cb):
     return "\n".join(texts)
 
 
-def summarize_transcript(transcript, progress_cb):
+def summarize_transcript(transcript, progress_cb, prompt_file=None):
     """分块提取要点, 再合并生成最终学习教程 Markdown"""
-    prompt_rules = PROMPT_FILE.read_text(encoding="utf-8") if PROMPT_FILE.exists() else ""
+    prompt_file = prompt_file or (BASE_DIR / DEFAULT_PROMPT)
+    prompt_rules = prompt_file.read_text(encoding="utf-8") if prompt_file.exists() else ""
 
     # 1) 分块提取要点
     chunks = []
@@ -224,50 +293,142 @@ def summarize_transcript(transcript, progress_cb):
 
 # ---------------- 任务流水线 ----------------
 
-def run_pipeline(task_id, url):
+def run_pipeline(task_id, url, prompt_name, mode="transcribe"):
+    """
+    两阶段流水线:
+
+    mode="transcribe": 下载 → 切分 → 转录 → 保存 transcript
+        完成后暂停, 状态置为 transcript_ready, 等待用户确认后继续
+    mode="tutorial":   读取已有 transcript → 生成教程 (复用已有教程时直接返回)
+    """
     work = WORK_DIR / task_id
+    prompt_file = resolve_prompt(prompt_name)
     try:
-        update_task(task_id, status="downloading", stage="下载音频", progress=2, message="开始下载…")
         os.makedirs(work, exist_ok=True)
 
-        mp3_path, title = download_audio(url, str(work),
-                                         lambda p, m: update_task(task_id, progress=p, message=m))
-        update_task(task_id, title=title)
+        if mode == "tutorial":
+            # ---- 阶段二: 生成教程 (必须已有 transcript) ----
+            transcript_path = find_transcript(work)
+            if not transcript_path:
+                raise RuntimeError("该任务还没有转录文本，无法生成教程")
+            transcript = transcript_path.read_text(encoding="utf-8")
+            update_task(task_id, transcript=transcript)
+            mp3 = find_mp3(work)
+            mp3_basename = mp3.stem if mp3 else transcript_path.stem.replace(".transcript", "")
+            update_task(task_id, title=load_title(work))
+        else:
+            # ---- 阶段一: 下载 → 切分 → 转录 → 保存 → 暂停等待确认 ----
+            transcript_path = find_transcript(work)
+            if transcript_path and transcript_path.stat().st_size > 0:
+                # 复用已有转录, 直接进入待确认状态
+                transcript = transcript_path.read_text(encoding="utf-8")
+                mp3 = find_mp3(work)
+                mp3_basename = mp3.stem if mp3 else transcript_path.stem.replace(".transcript", "")
+                update_task(task_id, title=load_title(work))
+            else:
+                # 下载音频
+                update_task(task_id, status="downloading", stage="下载音频", progress=2, message="开始下载…")
+                mp3_path, title = download_audio(url, str(work),
+                                                 lambda p, m: update_task(task_id, progress=p, message=m))
+                mp3_basename = Path(mp3_path).stem
+                update_task(task_id, title=title)
+                (work / "title.txt").write_text(title, encoding="utf-8")
 
-        update_task(task_id, status="splitting", stage="切分音频", progress=45, message="ffmpeg 切分中…")
-        parts = split_audio(mp3_path, work / "parts",
-                            lambda p, m: update_task(task_id, progress=p, message=m))
+                # 切分音频
+                update_task(task_id, status="splitting", stage="切分音频", progress=45, message="ffmpeg 切分中…")
+                parts = split_audio(mp3_path, work / "parts",
+                                    lambda p, m: update_task(task_id, progress=p, message=m))
 
-        update_task(task_id, status="transcribing", stage="语音转录", progress=52,
-                    message=f"共 {len(parts)} 段，开始转录…")
-        transcript = transcribe_all(parts, lambda p, m: update_task(task_id, progress=p, message=m))
+                # 语音转录
+                update_task(task_id, status="transcribing", stage="语音转录", progress=52,
+                            message=f"共 {len(parts)} 段，开始转录…")
+                transcript = transcribe_all(parts, lambda p, m: update_task(task_id, progress=p, message=m))
 
-        (work / "transcript.txt").write_text(transcript, encoding="utf-8")
-        update_task(task_id, transcript=transcript)
+                # 保存转录 (以 mp3 基名为前缀)
+                transcript_path = work / f"{mp3_basename}.transcript.txt"
+                transcript_path.write_text(transcript, encoding="utf-8")
 
-        update_task(task_id, status="summarizing", stage="生成教程", progress=85, message="调用 LLM 生成学习教程…")
-        markdown = summarize_transcript(transcript, lambda p, m: update_task(task_id, progress=p, message=m))
+            update_task(task_id, transcript=transcript)
 
-        (work / "tutorial.md").write_text(markdown, encoding="utf-8")
+            # 转录完成, 暂停等待用户确认
+            update_task(task_id, status="transcript_ready", stage="转录完成", progress=100,
+                        message="转录完成，确认无误后点击「继续生成教程」")
+            return
+
+        # ---- 教程文件路径 ----
+        if mp3_basename:
+            tutorial_path = work / f"{mp3_basename}.tutorial.md"
+        else:
+            tutorial_path = find_tutorial(work) or work / "tutorial.md"
+
+        # ---- 教程是否可复用 (存在且提示词相同) ----
+        prompt_used_path = work / "prompt_used.txt"
+        prompt_used = prompt_used_path.read_text(encoding="utf-8").strip() if prompt_used_path.exists() else ""
+        if tutorial_path.exists() and prompt_used == prompt_name:
+            markdown = tutorial_path.read_text(encoding="utf-8")
+            update_task(task_id, markdown=markdown, status="done", stage="完成", progress=100,
+                        message="复用已有教程 ✅")
+            return
+
+        # ---- 生成教程 ----
+        update_task(task_id, status="summarizing", stage="生成教程", progress=85,
+                    message="调用 LLM 生成学习教程…")
+        markdown = summarize_transcript(transcript,
+                                        lambda p, m: update_task(task_id, progress=p, message=m),
+                                        prompt_file)
+
+        tutorial_path.write_text(markdown, encoding="utf-8")
+        prompt_used_path.write_text(prompt_name, encoding="utf-8")
         update_task(task_id, markdown=markdown, status="done", stage="完成", progress=100,
                     message="教程生成完毕 ✅")
     except Exception as e:
         update_task(task_id, status="error", stage="出错", progress=0, message=str(e),
                     error=str(e))
     finally:
-        # 清理中间音频文件, 保留 transcript/tutorial
+        # 清理切分中间产物; 保留 mp3 / transcript / tutorial
         shutil.rmtree(work / "parts", ignore_errors=True)
-        for f in work.glob("*.mp3"):
-            try:
-                f.unlink()
-            except OSError:
-                pass
+
+
+# ---------------- 导出 ----------------
+
+def get_export_files(task_id):
+    """列出任务下可导出的文件 (mp3 / transcript / tutorial)"""
+    work = WORK_DIR / task_id
+    files = []
+    if not work.exists():
+        return files
+    for p in sorted(work.iterdir()):
+        if (p.is_file() and p.suffix in (".mp3", ".txt", ".md")
+                and p.name not in ("prompt_used.txt", "title.txt")):
+            files.append({"name": p.name, "size": p.stat().st_size})
+    return files
 
 
 # ---------------- API ----------------
 
 class GenerateRequest(BaseModel):
     url: str
+    prompt: str = ""
+
+
+class RegenerateRequest(BaseModel):
+    task_id: str
+    prompt: str = ""
+
+
+@app.get("/api/prompts")
+def api_prompts():
+    """返回可选的提示词文件列表及默认项"""
+    return {"prompts": list_prompt_files(), "default": DEFAULT_PROMPT}
+
+
+@app.get("/prompt_files/{name}")
+def api_prompt_file(name: str):
+    """返回指定提示词文件的原文 (供前端预览)"""
+    p = resolve_prompt(name)
+    if not p.exists() or p.suffix != ".md":
+        raise HTTPException(404, "提示词文件不存在")
+    return FileResponse(p, media_type="text/markdown; charset=utf-8")
 
 
 @app.post("/api/generate")
@@ -275,11 +436,74 @@ def api_generate(req: GenerateRequest):
     url = req.url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "请输入 http/https 开头的视频链接")
-    task_id = uuid.uuid4().hex[:12]
+    prompt_name = (req.prompt or "").strip() or DEFAULT_PROMPT
+    resolve_prompt(prompt_name)
+
+    task_id = make_task_id(url)  # 同一网址 → 同一任务
     with TASKS_LOCK:
-        TASKS[task_id] = {"status": "queued", "stage": "排队中", "progress": 0, "message": "任务已创建"}
-    threading.Thread(target=run_pipeline, args=(task_id, url), daemon=True).start()
+        existing = TASKS.get(task_id)
+        if existing and existing["status"] not in ("error",):
+            return {"task_id": task_id, "reused": "task_exists"}  # 已有任务, 前端直接轮询
+        TASKS[task_id] = {"status": "queued", "stage": "排队中", "progress": 0,
+                          "message": "任务已创建", "url": url}
+    threading.Thread(target=run_pipeline, args=(task_id, url, prompt_name, "transcribe"),
+                     daemon=True).start()
     return {"task_id": task_id}
+
+
+@app.post("/api/regenerate")
+def api_regenerate(req: RegenerateRequest):
+    """继续/重新生成教程: 读取已有 transcript, 只调用 LLM 生成教程"""
+    task_id = req.task_id.strip()
+    if not task_id:
+        raise HTTPException(400, "缺少 task_id")
+    prompt_name = (req.prompt or "").strip() or DEFAULT_PROMPT
+    resolve_prompt(prompt_name)
+
+    if not find_transcript(WORK_DIR / task_id):
+        raise HTTPException(400, "该任务还没有转录文本，无法生成教程")
+    with TASKS_LOCK:
+        if task_id not in TASKS:
+            TASKS[task_id] = {"status": "queued", "stage": "排队中", "progress": 0,
+                              "message": "任务已创建"}
+    threading.Thread(target=run_pipeline, args=(task_id, "", prompt_name, "tutorial"),
+                     daemon=True).start()
+    return {"task_id": task_id}
+
+
+@app.get("/api/files/{task_id}")
+def api_files(task_id: str):
+    """列出任务下可导出的文件"""
+    return {"files": get_export_files(task_id)}
+
+
+@app.get("/api/download/{task_id}/{filename}")
+def api_download(task_id: str, filename: str):
+    """下载任务下的单个文件"""
+    work = (WORK_DIR / task_id).resolve()
+    p = (work / filename).resolve()
+    if not str(p).startswith(str(work)) or not p.is_file():
+        raise HTTPException(404, "文件不存在")
+    return FileResponse(p, filename=p.name)
+
+
+@app.get("/api/export/{task_id}")
+def api_export(task_id: str):
+    """一键打包导出全部文件 (zip)"""
+    files = get_export_files(task_id)
+    if not files:
+        raise HTTPException(404, "任务下没有可导出的文件")
+    work = WORK_DIR / task_id
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(work / f["name"], arcname=f["name"])
+    buf.seek(0)
+    return Response(
+        buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{task_id}.zip"'},
+    )
 
 
 @app.get("/api/status/{task_id}")
