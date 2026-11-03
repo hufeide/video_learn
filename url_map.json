@@ -1,0 +1,14 @@
+{
+  "bilibili:BV1CfHM6nEtA": {
+    "key": "bilibili:BV1CfHM6nEtA",
+    "task_id": "2ee7c4b43359",
+    "urls": [
+      "https://www.bilibili.com/video/BV1CfHM6nEtA/?trackid=web_pegasus_0.router-web-pegasus-2479516-f6fct.1793629822559.373&spm_id_from=333.1007.tianma.15-2-56.click&vd_source=8a84b55c5821166c6c762cd90b1b5772",
+      "https://www.bilibili.com/video/BV1CfHM6nEtA/?trackid=new-test-999&spm_id_from=333.1007.tianma.15-2-56.click&vd_source=8a84b55c5821166c6c762cd90b1b5772",
+      "https://www.bilibili.com/video/BV1CfHM6nEtA/?trackid=final-test-123&spm_id_from=333.1007.tianma.15-2-56.click&vd_source=8a84b55c5821166c6c762cd90b1b5772"
+    ],
+    "created": "2026-11-03 13:12:24",
+    "last_used": "2026-11-03 13:17:38",
+    "migrated": true
+  }
+}

@@ -137,6 +137,26 @@
     padding: 4px 12px; text-decoration: none; font-size: 12px; font-weight: 600;
     flex-shrink: 0;
   }
+  .history-list { display: flex; flex-direction: column; gap: 8px; }
+  .hist-item {
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px;
+    cursor: pointer; transition: all .2s; background: #fff;
+  }
+  .hist-item:hover { border-color: var(--primary-light); background: #fafbff; }
+  .hist-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .hist-title { font-size: 14px; font-weight: 600; max-width: 420px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hist-status {
+    font-size: 11px; font-weight: 700; border-radius: 99px; padding: 2px 10px;
+    background: #f1f5f9; color: var(--muted); flex-shrink: 0;
+  }
+  .hist-status.done { background: #dcfce7; color: #15803d; }
+  .hist-status.transcript_ready { background: #fef3c7; color: #b45309; }
+  .hist-status.idle { background: #f1f5f9; color: #64748b; }
+  .hist-status.error { background: #fee2e2; color: #b91c1c; }
+  .hist-id { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .hist-urls { font-size: 11px; color: #94a3b8; margin-top: 3px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 600px; }
   footer { text-align: center; color: #64748b; font-size: 12px; margin-top: 30px; }
 </style>
 </head>
@@ -186,6 +206,14 @@
     <div class="panel" id="panelTranscript"><div class="transcript-panel" id="transcriptText"></div></div>
   </div>
 
+  <div class="card" id="historyCard">
+    <div class="toolbar">
+      <span class="title">📋 网址-任务对应表</span>
+      <button class="btn-ghost" onclick="loadHistory()">刷新</button>
+    </div>
+    <div id="historyList" class="history-list"><span class="hint">加载中…</span></div>
+  </div>
+
   <footer>后端: server.py · 转录: MOSS-Transcribe-Diarize · LLM: spark-x2.6</footer>
 </div>
 
@@ -225,7 +253,59 @@ function loadPromptPreview() {
     .catch(() => { document.getElementById('promptPreview').style.display = 'none'; });
 }
 
-window.addEventListener('DOMContentLoaded', loadPrompts);
+window.addEventListener('DOMContentLoaded', () => { loadPrompts(); loadHistory(); });
+
+// 加载网址-任务对应表
+function loadHistory() {
+  fetch('/api/tasks')
+    .then(r => r.json())
+    .then(d => {
+      const box = document.getElementById('historyList');
+      const tasks = d.tasks || [];
+      if (!tasks.length) {
+        box.innerHTML = '<span class="hint">暂无任务记录</span>';
+        return;
+      }
+      box.innerHTML = '';
+      tasks.forEach(t => {
+        const item = document.createElement('div');
+        item.className = 'hist-item';
+        item.onclick = () => loadTask(t.task_id);
+        const status = document.createElement('span');
+        status.className = 'hist-status ' + (t.status || 'idle');
+        status.textContent = t.status || 'idle';
+        const title = document.createElement('span');
+        title.className = 'hist-title';
+        title.textContent = t.title || t.key;
+        const id = document.createElement('div');
+        id.className = 'hist-id';
+        id.textContent = 'task_id: ' + t.task_id + ' · ' + (t.files ? t.files.length : 0) + ' 个文件';
+        const urls = document.createElement('div');
+        urls.className = 'hist-urls';
+        urls.textContent = '网址: ' + (t.urls || []).join('  |  ');
+        const main = document.createElement('div');
+        main.className = 'hist-main';
+        main.appendChild(title);
+        main.appendChild(status);
+        item.appendChild(main);
+        item.appendChild(id);
+        item.appendChild(urls);
+        box.appendChild(item);
+      });
+    })
+    .catch(() => {});
+}
+
+// 加载已有任务 (点击对应表)
+function loadTask(taskId) {
+  currentTask = taskId;
+  document.getElementById('urlInput').value = '';
+  document.getElementById('progressCard').style.display = 'block';
+  document.getElementById('resultCard').style.display = 'none';
+  document.getElementById('progressFill').style.width = '0%';
+  document.getElementById('progressPct').textContent = '0%';
+  poll(0);
+}
 
 function esc(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -328,6 +408,7 @@ function poll(tries) {
       if (t.status === 'done' || t.status === 'transcript_ready') {
         clearTimeout(pollTimer);
         showResult(t);
+        loadHistory();
         const btn = document.getElementById('btnGenerate');
         btn.disabled = false; btn.textContent = '再生成一个';
       } else if (t.status === 'error') {

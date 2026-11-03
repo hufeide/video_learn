@@ -13,15 +13,19 @@
             → 调用 spark-x2.6 LLM (按提示词文件规则) 生成学习教程 Markdown
 
 缓存策略:
-    - task_id 由视频网址唯一确定 (md5 哈希), 同一网址 = 同一任务
+    - 网址-任务对应表 (url_map.json): 按视频标识规范化匹配
+      (B站 BV 号 / av 号 / YouTube ID, 忽略跟踪参数差异)
+    - 同一视频 → 同一 task_id → 同一任务目录, 不重复下载 mp3
     - 若该任务下 transcript 已存在, 阶段一直接跳过下载/切分/转录, 暂停等待确认
     - 若 tutorial 已存在且使用的提示词相同, 阶段二直接返回已有教程
     - /api/regenerate 用于阶段二: 只生成教程, 不重新转录
+    - /api/status 在服务重启后可从磁盘恢复任务状态
 
 产物命名 (位于 work/{task_id}/ 下):
     - {mp3基名}.mp3            音频 (保留)
     - {mp3基名}.transcript.txt 转录文本
     - {mp3基名}.tutorial.md    学习教程
+    - url.txt                  原始网页地址
 
 导出:
     - GET /api/files/{task_id}         列出可导出文件
@@ -31,9 +35,10 @@
 接口:
     GET  /                     前端页面
     GET  /api/prompts          可选提示词文件列表
+    GET  /api/tasks            网址-任务对应表
     POST /api/generate         {"url": "...", "prompt": "..."}  阶段一: 转录
     POST /api/regenerate       {"task_id": "...", "prompt": "..."}  阶段二: 生成教程
-    GET  /api/status/{task_id} 轮询进度与结果
+    GET  /api/status/{task_id} 轮询进度与结果 (支持磁盘恢复)
 
 用法:
     python3 server.py [--host 0.0.0.0] [--port 8000]
@@ -42,10 +47,13 @@
 import argparse
 import hashlib
 import io
+import json
 import os
+import re
 import shutil
 import subprocess
 import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -59,6 +67,8 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = BASE_DIR / "work"
 DEFAULT_PROMPT = "video_prompt_0.md"
+URL_MAP_FILE = BASE_DIR / "url_map.json"
+URL_MAP_LOCK = threading.Lock()
 
 # 从 .env 读取配置（环境变量优先于 .env）
 load_dotenv(BASE_DIR / ".env")
@@ -94,6 +104,130 @@ def update_task(task_id, **kw):
 def make_task_id(url):
     """由视频网址生成唯一 task_id (md5 前 12 位)"""
     return hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
+
+
+def normalize_url(url):
+    """提取视频唯一标识, 去除跟踪参数差异 (同一视频不同参数 → 同一 key)"""
+    # B站 BV 号
+    m = re.search(r'(BV[0-9A-Za-z]+)', url)
+    if m:
+        return 'bilibili:' + m.group(1)
+    # B站 av 号
+    m = re.search(r'av(\d+)', url)
+    if m:
+        return 'bilibili:av' + m.group(1)
+    # YouTube youtu.be / shorts
+    m = re.search(r'youtu\.be/([\w-]+)', url)
+    if m:
+        return 'youtube:' + m.group(1)
+    m = re.search(r'youtube\.com/(?:watch\?(?:v=)?|shorts/|embed/|live/)([\w-]+)', url)
+    if m:
+        return 'youtube:' + m.group(1)
+    # 其他站点: 用原始 URL
+    return url
+
+
+def load_url_map():
+    """读取网址-任务映射表"""
+    if URL_MAP_FILE.exists():
+        try:
+            return json.loads(URL_MAP_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_url_map(data):
+    URL_MAP_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def migrate_legacy_tasks():
+    """
+    服务启动时调用: 把旧任务目录 (md5(url) 命名) 迁移进网址-任务对应表
+    同一视频的多个旧任务目录会被合并, 选中最优的一个 (有 tutorial 优先, 最新优先)
+    """
+    if load_url_map():
+        return
+    groups = {}  # key -> [(work_dir, url), ...]
+    if WORK_DIR.exists():
+        for work in sorted(WORK_DIR.iterdir()):
+            if not work.is_dir():
+                continue
+            url = ""
+            tp = work / "url.txt"
+            if tp.exists():
+                url = tp.read_text(encoding="utf-8").strip()
+            if url:
+                key = normalize_url(url)
+            else:
+                # 无 url.txt 的旧任务: 尝试从 mp3 文件名提取视频标识
+                key = None
+                for mp3 in work.glob("*.mp3"):
+                    m = re.search(r'(BV[0-9A-Za-z]+)', mp3.name)
+                    if m:
+                        key = 'bilibili:' + m.group(1)
+                        break
+                if key is None:
+                    key = work.name  # 无法识别, 保留为独立条目
+            groups.setdefault(key, []).append((work, url))
+    if not groups:
+        return
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    data = {}
+    for key, items in groups.items():
+        # 排序: 有 tutorial 优先, 其次修改时间最新
+        def rank(item):
+            work, _ = item
+            has_tu = bool(list(work.glob("*.tutorial.md"))) or (work / "tutorial.md").exists()
+            return (has_tu, work.stat().st_mtime)
+        items.sort(key=rank, reverse=True)
+        winner, _ = items[0]
+        urls = list(dict.fromkeys(u for _, u in items if u))
+        data[key] = {
+            "key": key,
+            "task_id": winner.name,
+            "urls": urls,
+            "created": now,
+            "last_used": now,
+            "migrated": True,
+        }
+    save_url_map(data)
+    print(f"已迁移 {len(data)} 个旧任务到 url_map.json")
+
+
+def get_or_create_task_id(url):
+    """
+    由视频网址获取任务 ID (网址-任务对应表):
+    - 按规范化后的视频标识匹配, 同一视频不同跟踪参数视为同一任务
+    - 已有映射时直接返回映射表中的 task_id (复用任务目录)
+    - 首次访问则用 md5(key) 生成 task_id 并创建映射记录
+    """
+    key = normalize_url(url)
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    with URL_MAP_LOCK:
+        data = load_url_map()
+        entry = data.get(key)
+        if entry:
+            # 已有任务: 复用其 task_id
+            task_id = entry.get("task_id") or hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
+            urls = entry.get("urls", [])
+            if url not in urls:
+                urls.append(url)
+                entry["urls"] = urls
+            entry["last_used"] = now
+            save_url_map(data)
+            return task_id
+        # 新视频: 生成 task_id 并创建映射
+        task_id = hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
+        data[key] = {
+            "key": key,
+            "task_id": task_id,
+            "urls": [url],
+            "created": now,
+            "last_used": now,
+        }
+        save_url_map(data)
+        return task_id
 
 
 def list_prompt_files():
@@ -306,6 +440,10 @@ def run_pipeline(task_id, url, prompt_name, mode="transcribe"):
     try:
         os.makedirs(work, exist_ok=True)
 
+        # 保存原始网页地址
+        if url:
+            (work / "url.txt").write_text(url, encoding="utf-8")
+
         if mode == "tutorial":
             # ---- 阶段二: 生成教程 (必须已有 transcript) ----
             transcript_path = find_transcript(work)
@@ -439,7 +577,7 @@ def api_generate(req: GenerateRequest):
     prompt_name = (req.prompt or "").strip() or DEFAULT_PROMPT
     resolve_prompt(prompt_name)
 
-    task_id = make_task_id(url)  # 同一网址 → 同一任务
+    task_id = get_or_create_task_id(url)  # 网址-任务对应表 (同一视频 → 同一任务)
     with TASKS_LOCK:
         existing = TASKS.get(task_id)
         if existing and existing["status"] not in ("error",):
@@ -506,12 +644,62 @@ def api_export(task_id: str):
     )
 
 
+@app.get("/api/tasks")
+def api_tasks():
+    """返回网址-任务对应表 (含文件状态)"""
+    entries = []
+    with TASKS_LOCK:
+        tasks = dict(TASKS)
+    for key, info in load_url_map().items():
+        task_id = info.get("task_id", "")
+        work = WORK_DIR / task_id
+        entry = dict(info)
+        entry["files"] = [f["name"] for f in get_export_files(task_id)]
+        task = tasks.get(task_id)
+        if task:
+            entry["status"] = task["status"]
+            entry["title"] = task.get("title", "")
+        else:
+            # 服务重启后内存任务丢失, 从磁盘推断
+            tp = find_transcript(work)
+            tu = find_tutorial(work)
+            if tu:
+                entry["status"] = "done"
+            elif tp:
+                entry["status"] = "transcript_ready"
+            else:
+                entry["status"] = "idle"
+            entry["title"] = load_title(work)
+        entries.append(entry)
+    return {"tasks": entries}
+
+
 @app.get("/api/status/{task_id}")
 def api_status(task_id: str):
     with TASKS_LOCK:
         task = TASKS.get(task_id)
     if not task:
-        raise HTTPException(404, "任务不存在")
+        # 内存中没有 (如服务重启), 从磁盘恢复任务状态
+        work = WORK_DIR / task_id
+        tp = find_transcript(work)
+        tu = find_tutorial(work)
+        if not tp:
+            raise HTTPException(404, "任务不存在")
+        task = {
+            "status": "transcript_ready",
+            "stage": "转录完成",
+            "progress": 100,
+            "message": "转录完成，确认无误后点击「继续生成教程」",
+            "title": load_title(work),
+            "transcript": tp.read_text(encoding="utf-8"),
+        }
+        if tu:
+            task["status"] = "done"
+            task["stage"] = "完成"
+            task["message"] = "教程生成完毕 ✅"
+            task["markdown"] = tu.read_text(encoding="utf-8")
+        with TASKS_LOCK:
+            TASKS[task_id] = task
     return task
 
 
@@ -526,6 +714,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
     WORK_DIR.mkdir(parents=True, exist_ok=True)
+    migrate_legacy_tasks()
     print(f"服务启动: http://{args.host}:{args.port}")
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)
