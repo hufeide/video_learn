@@ -309,6 +309,19 @@ def download_audio(url, out_dir, progress_cb):
         "newline": True,
         "logger": _ProgressLogger(progress_cb),
     }
+    # 代理: YouTube 等境外站点需要 (通过 .env 的 YTDLP_PROXY 配置)
+    proxy = os.environ.get("YTDLP_PROXY", "").strip()
+    if proxy:
+        opts["proxy"] = proxy
+    # cookies: YouTube 常需要登录态 (PO token / 人机验证)
+    #   方式1: 从浏览器读取 (需浏览器在运行), 如 YTDLP_COOKIES_BROWSER=chrome
+    #   方式2: 指定 cookies.txt 文件, 如 YTDLP_COOKIE_FILE=/path/cookies.txt
+    cookies_browser = os.environ.get("YTDLP_COOKIES_BROWSER", "").strip()
+    cookie_file = os.environ.get("YTDLP_COOKIE_FILE", "").strip()
+    if cookies_browser:
+        opts["cookiesfrombrowser"] = (cookies_browser,)
+    elif cookie_file and os.path.exists(cookie_file):
+        opts["cookiefile"] = cookie_file
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
     title = info.get("title", "video")
@@ -343,6 +356,9 @@ class _ProgressLogger:
         pass
 
     def warning(self, msg):
+        pass
+
+    def error(self, msg):
         pass
 
 
