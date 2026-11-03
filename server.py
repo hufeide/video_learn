@@ -368,9 +368,10 @@ def split_audio(mp3_path, parts_dir, progress_cb):
     pattern = os.path.join(parts_dir, "audio_part_%03d.mp3")
     cmd = ["ffmpeg", "-y", "-i", mp3_path, "-f", "segment",
            "-segment_time", str(SEGMENT_TIME), "-c", "copy", pattern]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True)  # bytes 模式, 避免中文文件名导致解码错误
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg 切分失败: {proc.stderr[-500:]}")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"ffmpeg 切分失败: {stderr[-500:]}")
     parts = sorted(parts_dir.glob("audio_part_*.mp3"))
     progress_cb(50, f"切分完成，共 {len(parts)} 段")
     return parts
