@@ -101,6 +101,18 @@
   .panel { display: none; }
   .panel.active { display: block; }
 
+  /* 输入模式切换 */
+  .mode-tabs { display: flex; gap: 4px; background: #f1f5f9; border-radius: 10px; padding: 4px; margin-bottom: 14px; }
+  .mode-tab {
+    padding: 8px 18px; border-radius: 8px; font-size: 14px; cursor: pointer;
+    color: var(--muted); border: none; background: transparent; transition: all .2s;
+  }
+  .mode-tab.active { background: #fff; color: var(--primary); font-weight: 600; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .input-row input[type="file"] {
+    flex: 1; padding: 10px; border: 2px dashed var(--border); border-radius: 10px;
+    background: #f8fafc; font-size: 14px;
+  }
+
   /* Markdown 渲染样式 */
   .md { line-height: 1.8; font-size: 15px; }
   .md h1 { font-size: 24px; margin: 20px 0 12px; padding-bottom: 8px; border-bottom: 2px solid var(--border); }
@@ -137,6 +149,26 @@
     padding: 4px 12px; text-decoration: none; font-size: 12px; font-weight: 600;
     flex-shrink: 0;
   }
+  /* 关键帧 */
+  .kf-controls { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  .kf-controls label { font-size: 13px; font-weight: 600; }
+  .kf-controls select {
+    padding: 8px 12px; border: 2px solid var(--border); border-radius: 8px;
+    font-size: 13px; outline: none; background: #fff; cursor: pointer;
+  }
+  .kf-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+  .kf-cell { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: #f8fafc; cursor: zoom-in; }
+  .kf-cell img { width: 100%; display: block; aspect-ratio: 16/9; object-fit: cover; background: #0f172a; }
+  .kf-cell .kf-ts { font-size: 11px; color: var(--muted); padding: 4px 8px; text-align: center; }
+  /* 图片放大遮罩 */
+  .lightbox {
+    position: fixed; inset: 0; z-index: 1000; background: rgba(15, 23, 42, 0.92);
+    display: none; align-items: center; justify-content: center; flex-direction: column;
+    cursor: zoom-out; padding: 40px;
+  }
+  .lightbox.open { display: flex; }
+  .lightbox img { max-width: 92vw; max-height: 82vh; border-radius: 8px; box-shadow: 0 8px 40px rgba(0,0,0,.5); }
+  .lightbox .lb-info { color: #e2e8f0; font-size: 14px; margin-top: 14px; }
   footer { text-align: center; color: #64748b; font-size: 12px; margin-top: 30px; }
 </style>
 </head>
@@ -144,19 +176,32 @@
 <div class="container">
   <header>
     <h1>🎬 视频教程生成器</h1>
-    <p>输入视频链接 → 自动转录 → AI 生成学习教程</p>
+    <p>输入视频链接，或上传视频 / 音频文件 → 自动提取音频并转录 → AI 生成学习教程</p>
   </header>
 
   <div class="card">
-    <div class="input-row">
+    <div class="mode-tabs">
+      <button class="mode-tab active" data-mode="url" onclick="switchMode('url')">🔗 视频链接</button>
+      <button class="mode-tab" data-mode="video" onclick="switchMode('video')">🎬 上传视频</button>
+      <button class="mode-tab" data-mode="upload" onclick="switchMode('upload')">📁 上传音频</button>
+    </div>
+    <div class="input-row" id="urlRow">
       <input id="urlInput" type="text" placeholder="粘贴 B站 / YouTube 视频链接…"
              value="https://www.bilibili.com/video/BV1CfHM6nEtA/">
       <button id="btnGenerate" class="btn-primary" onclick="startGenerate()">生成教程</button>
     </div>
+    <div class="input-row" id="videoRow" style="display:none">
+      <input id="videoFileInput" type="file" accept="video/*,.mkv,.flv,.avi,.rmvb,.mov,.ts,.m2ts,.3gp,.mpeg,.mpg,.wmv">
+      <button id="btnVideoUpload" class="btn-primary" onclick="startUpload('videoFileInput','btnVideoUpload')">开始处理</button>
+    </div>
+    <div class="input-row" id="uploadRow" style="display:none">
+      <input id="fileInput" type="file" accept="audio/*,.mp3,.m4a,.wav,.flac,.ogg,.aac,.opus">
+      <button id="btnUpload" class="btn-primary" onclick="startUpload('fileInput','btnUpload')">开始处理</button>
+    </div>
     <div class="prompt-row">
       <label for="promptSelect">提示词</label>
       <select id="promptSelect" onchange="loadPromptPreview()"></select>
-      <span class="hint" style="margin:0">选择教程生成规则（同一网址的转录只做一次，之后可反复重新生成教程）</span>
+      <span class="hint" style="margin:0">选择教程生成规则（同一视频 / 同一音视频文件只转录一次，之后可反复重新生成教程）</span>
     </div>
     <pre id="promptPreview" class="prompt-preview" style="display:none"></pre>
   </div>
@@ -181,17 +226,33 @@
     <div class="tabs">
       <button class="tab active" data-tab="tutorial" onclick="switchTab('tutorial')">📖 学习教程</button>
       <button class="tab" data-tab="transcript" onclick="switchTab('transcript')">📝 原文转录</button>
+      <button class="tab" data-tab="keyframes" onclick="switchTab('keyframes')">🖼 关键帧</button>
     </div>
     <div class="panel active" id="panelTutorial"><div class="md" id="tutorialMd"></div></div>
     <div class="panel" id="panelTranscript"><div class="transcript-panel" id="transcriptText"></div></div>
+    <div class="panel" id="panelKeyframes">
+      <div class="kf-controls">
+        <label for="kfCount">展示数量</label>
+        <select id="kfCount" onchange="loadKeyframes()"></select>
+        <span class="hint" style="margin:0" id="kfHint"></span>
+      </div>
+      <div class="kf-grid" id="kfGrid"></div>
+      <div class="hint" id="kfEmpty" style="display:none">该任务没有提取到关键帧（可能视频无画面变化，或为纯音频任务）</div>
+    </div>
   </div>
 
   <footer>后端: server.py · 转录: MOSS-Transcribe-Diarize · LLM: spark-x2.6</footer>
 </div>
 
+<div class="lightbox" id="lightbox" onclick="closeLightbox()">
+  <img id="lightboxImg" src="" alt="关键帧放大">
+  <div class="lb-info" id="lightboxInfo"></div>
+</div>
+
 <script>
 let pollTimer = null;
 let currentTask = null;
+let mode = 'url';
 
 // 加载提示词列表
 function loadPrompts() {
@@ -267,6 +328,51 @@ function renderMd(md) {
   return html.join('\n');
 }
 
+// 切换「视频链接 / 上传视频 / 上传音频」输入模式
+function switchMode(m) {
+  mode = m;
+  document.querySelectorAll('.mode-tab').forEach(el => el.classList.toggle('active', el.dataset.mode === m));
+  document.getElementById('urlRow').style.display = m === 'url' ? 'flex' : 'none';
+  document.getElementById('videoRow').style.display = m === 'video' ? 'flex' : 'none';
+  document.getElementById('uploadRow').style.display = m === 'upload' ? 'flex' : 'none';
+}
+
+// 重置进度区显示
+function resetProgress() {
+  document.getElementById('progressFill').style.width = '0%';
+  document.getElementById('progressPct').textContent = '0%';
+  document.getElementById('stageBadge').textContent = '排队中';
+  document.getElementById('progressMsg').textContent = '任务已创建…';
+  document.getElementById('progressStageText').textContent = '';
+}
+
+// 上传本地视频/音频文件 → 提取音频 → 转录 → (确认后) 生成教程
+function startUpload(fileInputId, btnId) {
+  const fileInput = document.getElementById(fileInputId);
+  const file = fileInput.files[0];
+  if (!file) { alert('请先选择要上传的文件'); return; }
+  const prompt = document.getElementById('promptSelect').value || 'video_prompt_0.md';
+  const btn = document.getElementById(btnId);
+  btn.disabled = true; btn.textContent = '上传中…';
+  document.getElementById('progressCard').style.display = 'block';
+  document.getElementById('resultCard').style.display = 'none';
+  resetProgress();
+
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('prompt', prompt);
+  fetch('/api/upload', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(d => {
+      if (d.task_id) {
+        currentTask = d.task_id;
+        fileInput.value = '';
+        poll(0);
+      }
+    })
+    .catch(e => { alert('请求失败: ' + e.message); btn.disabled = false; btn.textContent = '开始处理'; });
+}
+
 function startGenerate() {
   const url = document.getElementById('urlInput').value.trim();
   if (!/^https?:\/\//.test(url)) { alert('请输入 http/https 开头的链接'); return; }
@@ -275,11 +381,7 @@ function startGenerate() {
   btn.disabled = true; btn.textContent = '生成中…';
   document.getElementById('progressCard').style.display = 'block';
   document.getElementById('resultCard').style.display = 'none';
-  document.getElementById('progressFill').style.width = '0%';
-  document.getElementById('progressPct').textContent = '0%';
-  document.getElementById('stageBadge').textContent = '排队中';
-  document.getElementById('progressMsg').textContent = '任务已创建…';
-  document.getElementById('progressStageText').textContent = '';
+  resetProgress();
 
   fetch('/api/generate', {
     method: 'POST',
@@ -330,11 +432,19 @@ function poll(tries) {
         showResult(t);
         const btn = document.getElementById('btnGenerate');
         btn.disabled = false; btn.textContent = '再生成一个';
+        const bu = document.getElementById('btnUpload');
+        bu.disabled = false; bu.textContent = '开始处理';
+        const bv = document.getElementById('btnVideoUpload');
+        bv.disabled = false; bv.textContent = '开始处理';
       } else if (t.status === 'error') {
         clearTimeout(pollTimer);
         alert('生成失败: ' + (t.error || '未知错误'));
         const btn = document.getElementById('btnGenerate');
         btn.disabled = false; btn.textContent = '生成教程';
+        const bu = document.getElementById('btnUpload');
+        bu.disabled = false; bu.textContent = '开始处理';
+        const bv = document.getElementById('btnVideoUpload');
+        bv.disabled = false; bv.textContent = '开始处理';
       } else if (tries < 600) {
         pollTimer = setTimeout(() => poll(tries + 1), 3000);
       }
@@ -354,6 +464,7 @@ function showResult(t) {
   document.getElementById('btnRegen').disabled = false;
   document.getElementById('btnRegen').textContent = ready ? '继续生成教程' : '重新生成教程';
   loadFilesBox(t);
+  loadKeyframesPanel();
   if (ready) switchTab('transcript');  // 转录完成, 先展示原文
   document.getElementById('resultCard').scrollIntoView({ behavior: 'smooth' });
 }
@@ -370,7 +481,7 @@ function loadFilesBox(t) {
       files.forEach(f => {
         const chip = document.createElement('span');
         chip.className = 'file-chip';
-        const icon = f.name.endsWith('.mp3') ? '🎵' : (f.name.endsWith('.md') ? '📖' : '📝');
+        const icon = f.name.endsWith('.mp3') ? '🎵' : (f.name.endsWith('.md') ? '📖' : (f.name.endsWith('.jpg') ? '🖼' : '📝'));
         const label = f.name.replace(/^.*?(?=\.[^.]+$)/, '') || f.name;
         const a = document.createElement('a');
         a.href = '/api/download/' + encodeURIComponent(currentTask) + '/' + encodeURIComponent(f.name);
@@ -388,6 +499,82 @@ function loadFilesBox(t) {
     .catch(() => {});
 }
 
+// 加载关键帧面板 (选择展示张数, 平均间隔选取)
+function loadKeyframesPanel() {
+  if (!currentTask) return;
+  fetch('/api/keyframes/' + encodeURIComponent(currentTask))
+    .then(r => r.json())
+    .then(d => {
+      const frames = d.frames || [];
+      const total = d.total || 0;
+      const grid = document.getElementById('kfGrid');
+      const empty = document.getElementById('kfEmpty');
+      const tabBtn = document.querySelector('.tab[data-tab="keyframes"]');
+      grid.innerHTML = '';
+      if (!total) {
+        tabBtn.style.display = 'none';
+        empty.style.display = 'block';
+        return;
+      }
+      tabBtn.style.display = '';
+      const sel = document.getElementById('kfCount');
+      sel.innerHTML = '';
+      const max = Math.min(total, 24);
+      const def = Math.min(6, total);
+      for (let n = 1; n <= max; n++) {
+        const opt = document.createElement('option');
+        opt.value = n; opt.textContent = n + ' 张';
+        if (n === def) opt.selected = true;
+        sel.appendChild(opt);
+      }
+      document.getElementById('kfHint').textContent =
+        '共提取 ' + total + ' 张关键帧，按时间平均间隔选取展示';
+      loadKeyframes();
+    })
+    .catch(() => {});
+}
+
+// 按选择的张数加载关键帧 (后端平均间隔选取)
+function loadKeyframes() {
+  if (!currentTask) return;
+  const n = document.getElementById('kfCount').value || 0;
+  fetch('/api/keyframes/' + encodeURIComponent(currentTask) + '?count=' + n)
+    .then(r => r.json())
+    .then(d => {
+      const grid = document.getElementById('kfGrid');
+      grid.innerHTML = '';
+      (d.frames || []).forEach(f => {
+        const cell = document.createElement('div');
+        cell.className = 'kf-cell';
+        const img = document.createElement('img');
+        img.src = '/api/keyframes/' + encodeURIComponent(currentTask) + '/file/' + encodeURIComponent(f.name);
+        img.loading = 'lazy';
+        img.alt = '关键帧 ' + f.index;
+        img.onclick = () => openLightbox(img.src, '#' + f.index + ' · ' + f.ts.toFixed(1) + 's');
+        const ts = document.createElement('div');
+        ts.className = 'kf-ts';
+        ts.textContent = '#' + f.index + ' · ' + f.ts.toFixed(1) + 's';
+        cell.appendChild(img);
+        cell.appendChild(ts);
+        grid.appendChild(cell);
+      });
+    })
+    .catch(() => {});
+}
+
+// 点击放大查看关键帧 (lightbox, 不下载)
+function openLightbox(src, info) {
+  document.getElementById('lightboxImg').src = src;
+  document.getElementById('lightboxInfo').textContent = info;
+  document.getElementById('lightbox').classList.add('open');
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('open');
+  document.getElementById('lightboxImg').src = '';
+}
+// ESC 关闭放大
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
 // 一键导出 zip
 function exportZip() {
   if (!currentTask) return;
@@ -398,6 +585,7 @@ function switchTab(tab) {
   document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
   document.getElementById('panelTutorial').classList.toggle('active', tab === 'tutorial');
   document.getElementById('panelTranscript').classList.toggle('active', tab === 'transcript');
+  document.getElementById('panelKeyframes').classList.toggle('active', tab === 'keyframes');
 }
 
 function copyMarkdown() {

@@ -3,9 +3,14 @@
 """
 视频教程生成器后端
 
-流程 (两阶段):
-    阶段一: 输入视频网址
-            → yt-dlp 下载音频 (MP3)
+流程 (两阶段, 支持两种输入):
+    输入方式一 (视频网址): 阶段一: 输入视频网址
+            → yt-dlp 下载视频+音频 (提取 MP3)
+    输入方式二 (上传文件): 阶段一: 上传本地音视频文件 (mp3/m4a/wav/mp4/mkv/avi 等)
+            → 保存到任务目录
+    两种输入共同:
+            → ffmpeg 场景检测提取关键帧 (存 frames/, 用户可选展示张数与平均间隔)
+            → ffmpeg 提取音频 (视频提取音轨 / 非 mp3 转码为 MP3)
             → ffmpeg 按 120 秒切分
             → 本地 MOSS-Transcribe-Diarize (localhost:9005) 逐段转录
             → 保存 transcript.txt, 暂停并展示给用户确认
@@ -26,9 +31,11 @@
     - {mp3基名}.transcript.txt 转录文本
     - {mp3基名}.tutorial.md    学习教程
     - url.txt                  原始网页地址
+    - frames/kf_*.jpg          视频关键帧 (场景检测)
+    - frames/keyframes.json    关键帧索引与时间戳
 
 导出:
-    - GET /api/files/{task_id}         列出可导出文件
+    - GET /api/files/{task_id}         列出可导出文件 (含关键帧)
     - GET /api/download/{task_id}/{name} 下载单个文件
     - GET /api/export/{task_id}        一键打包 zip 导出
 
@@ -36,9 +43,12 @@
     GET  /                     前端页面
     GET  /api/prompts          可选提示词文件列表
     GET  /api/tasks            网址-任务对应表
-    POST /api/generate         {"url": "...", "prompt": "..."}  阶段一: 转录
+    POST /api/generate         {"url": "...", "prompt": "..."}  阶段一: 提取音频并转录
+    POST /api/upload           上传音视频文件 (multipart: file, prompt)  阶段一: 提取音频并转录
     POST /api/regenerate       {"task_id": "...", "prompt": "..."}  阶段二: 生成教程
     GET  /api/status/{task_id} 轮询进度与结果 (支持磁盘恢复)
+    GET  /api/keyframes/{task_id}             列出关键帧 (?count=N 返回平均间隔子集)
+    GET  /api/keyframes/{task_id}/file/{name} 关键帧图片
 
 用法:
     python3 server.py [--host 0.0.0.0] [--port 8000]
@@ -52,15 +62,17 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import zipfile
 from pathlib import Path
 
 import requests
+import websocket
 import yt_dlp
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
@@ -85,6 +97,16 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "spark-x2.6")
 
 # ---- 转录分块总结的每块字符数 (中文 ~1字≈1token, 留余量) ----
 CHUNK_CHARS = 8000
+
+# ---- 上传音视频限制 ----
+UPLOAD_MAX_MB = int(os.environ.get("UPLOAD_MAX_MB", "1024"))  # 单文件大小上限
+AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".aac", ".opus", ".m4b"}
+VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".flv", ".webm", ".wmv", ".ts", ".m2ts", ".3gp", ".mpeg", ".mpg", ".rmvb", ".rm"}
+
+# ---- 关键帧提取 ----
+SCENE_THRESHOLD = float(os.environ.get("SCENE_THRESHOLD", "0.3"))  # 场景检测阈值
+KEYFRAME_WIDTH = int(os.environ.get("KEYFRAME_WIDTH", "640"))      # 关键帧宽度
+KEYFRAME_FALLBACK_COUNT = 30   # 无场景变化时均匀抽帧的目标张数
 
 app = FastAPI(title="视频教程生成器")
 
@@ -230,6 +252,43 @@ def get_or_create_task_id(url):
         return task_id
 
 
+def safe_filename(name):
+    """清理上传文件名, 防止路径穿越"""
+    name = Path(name or "audio.mp3").name
+    if not name or ".." in name or "/" in name or "\\" in name:
+        name = "audio.mp3"
+    return name
+
+
+def register_upload_task(file_md5, filename):
+    """
+    登记上传任务到网址-任务对应表:
+    - key = "upload:" + 文件内容 md5, 同一文件内容 → 同一任务 (复用转录/教程缓存)
+    - 首次上传创建映射并返回 (task_id, False); 已有则复用并返回 (task_id, True)
+    """
+    key = f"upload:{file_md5}"
+    task_id = hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    with URL_MAP_LOCK:
+        data = load_url_map()
+        entry = data.get(key)
+        if entry:
+            entry["last_used"] = now
+            save_url_map(data)
+            return task_id, True
+        data[key] = {
+            "key": key,
+            "task_id": task_id,
+            "urls": [],
+            "filename": filename,
+            "type": "upload",
+            "created": now,
+            "last_used": now,
+        }
+        save_url_map(data)
+    return task_id, False
+
+
 def list_prompt_files():
     """列出 BASE_DIR 下所有可用的 .md 提示词文件"""
     return sorted(p.name for p in BASE_DIR.glob("*.md"))
@@ -268,6 +327,120 @@ def find_mp3(work):
     return None
 
 
+def find_upload_source(work):
+    """查找上传的源文件 (非 mp3 的音频/视频文件)"""
+    for p in sorted(work.iterdir()):
+        ext = p.suffix.lower()
+        if p.is_file() and ext in (AUDIO_EXTS | VIDEO_EXTS) and ext != ".mp3":
+            return p
+    return None
+
+
+def convert_audio(src_path, out_path):
+    """ffmpeg 提取音轨并转码为 mp3 (16kHz 单声道 128k, 适合语音转录; -vn 跳过视频流)"""
+    cmd = ["ffmpeg", "-y", "-i", str(src_path), "-vn", "-ac", "1", "-ar", "16000",
+           "-c:a", "libmp3lame", "-b:a", "128k", str(out_path)]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"ffmpeg 音频提取失败: {stderr[-500:]}")
+
+
+def has_video_stream(path):
+    """检查文件是否包含视频流"""
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=index", "-of", "csv=p=0", str(path)]
+    proc = subprocess.run(cmd, capture_output=True)
+    return bool(proc.stdout.strip())
+
+
+def probe_duration(path):
+    """获取媒体时长 (秒), 失败返回 0"""
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+           "-of", "csv=p=0", str(path)]
+    proc = subprocess.run(cmd, capture_output=True)
+    try:
+        return float(proc.stdout.decode("utf-8", errors="replace").strip())
+    except ValueError:
+        return 0.0
+
+
+def extract_keyframes(video_path, frames_dir, progress_cb=None):
+    """
+    ffmpeg 场景检测提取关键帧, 返回 [{index, name, ts}]
+    - select='gt(scene,阈值)' 提取场景变化帧, showinfo 记录时间戳
+    - 若无场景变化 (单一镜头), 退化为按时间均匀抽帧
+    """
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    for old in frames_dir.glob("*.jpg"):
+        old.unlink()
+    (frames_dir / "keyframes.json").unlink(missing_ok=True)
+
+    if not has_video_stream(video_path):
+        return []
+    if progress_cb:
+        progress_cb(41, "ffmpeg 场景检测中…")
+
+    pattern = str(frames_dir / "kf_%04d.jpg")
+    vf = f"select='gt(scene,{SCENE_THRESHOLD})',showinfo,scale={KEYFRAME_WIDTH}:-2"
+    proc = subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-vf", vf,
+                           "-vsync", "vfr", pattern], capture_output=True)
+    frames = sorted(frames_dir.glob("kf_*.jpg"))
+
+    # 从 showinfo 输出解析每帧时间戳
+    ts_list = re.findall(r"pts_time:(\d+(?:\.\d+)?)",
+                         proc.stderr.decode("utf-8", errors="replace"))
+
+    if not frames:
+        # 无场景变化: 退化为均匀抽帧
+        duration = probe_duration(video_path)
+        if duration > 1:
+            interval = max(2.0, duration / KEYFRAME_FALLBACK_COUNT)
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(video_path),
+                 "-vf", f"fps=1/{interval:.3f},scale={KEYFRAME_WIDTH}:-2",
+                 str(frames_dir / "kf_%04d.jpg")],
+                capture_output=True)
+            frames = sorted(frames_dir.glob("kf_*.jpg"))
+            ts_list = [round((i + 0.5) * interval, 2) for i in range(len(frames))]
+
+    result = []
+    for i, f in enumerate(frames, 1):
+        ts = float(ts_list[i - 1]) if i - 1 < len(ts_list) else 0.0
+        result.append({"index": i, "name": f.name, "ts": round(ts, 2)})
+    (frames_dir / "keyframes.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    if progress_cb:
+        progress_cb(44, f"关键帧提取完成，共 {len(result)} 张")
+    return result
+
+
+def select_even_frames(frames, n):
+    """从关键帧中按时间平均间隔选取 n 张 (去重保序)"""
+    if not frames:
+        return []
+    if n >= len(frames):
+        return frames
+    if n <= 1:
+        return [frames[len(frames) // 2]]
+    t0, t1 = frames[0]["ts"], frames[-1]["ts"]
+    idx = []
+    for i in range(n):
+        if t1 > t0:
+            t = t0 + (t1 - t0) * i / (n - 1)
+            best = min(range(len(frames)), key=lambda j: abs(frames[j]["ts"] - t))
+        else:
+            best = round(i * (len(frames) - 1) / (n - 1))
+        idx.append(best)
+    seen = set()
+    out = []
+    for j in idx:
+        if j not in seen:
+            seen.add(j)
+            out.append(frames[j])
+    return out
+
+
 def load_title(work):
     tp = work / "title.txt"
     return tp.read_text(encoding="utf-8").strip() if tp.exists() else ""
@@ -289,8 +462,8 @@ def llm_chat(messages, temperature=0.3, max_tokens=8192, timeout=180):
     return data["choices"][0]["message"]["content"]
 
 
-def download_audio(url, out_dir, progress_cb):
-    """yt-dlp 下载并转码为 MP3, 返回 (mp3_path, title)"""
+def download_media(url, out_dir, progress_cb):
+    """yt-dlp 下载视频+音频并提取 MP3, 保留视频文件, 返回 (mp3_path, video_path, title)"""
     opts = {
         "ignoreerrors": False,
         "noplaylist": True,
@@ -298,7 +471,7 @@ def download_audio(url, out_dir, progress_cb):
         "fragment_retries": 3,
         "concurrent_fragment_downloads": 4,
         "windowsfilenames": True,
-        "format": "bestaudio/best",
+        "format": "bestvideo+bestaudio/best",
         "outtmpl": os.path.join(out_dir, "%(title)s [%(id)s].%(ext)s"),
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"},
@@ -322,15 +495,24 @@ def download_audio(url, out_dir, progress_cb):
         opts["cookiesfrombrowser"] = (cookies_browser,)
     elif cookie_file and os.path.exists(cookie_file):
         opts["cookiefile"] = cookie_file
+    # JS runtime: YouTube JS 挑战求解需要 (推荐 deno, 首次需下载 EJS 组件)
+    js_runtime = os.environ.get("YTDLP_JS_RUNTIME", "deno").strip()
+    if js_runtime:
+        opts["js_runtimes"] = {js_runtime: {}}
+        opts["remote_components"] = {"ejs:github"}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
     title = info.get("title", "video")
-    mp3_path = ydl.prepare_filename(info).rsplit(".", 1)[0] + ".mp3"
+    base = ydl.prepare_filename(info).rsplit(".", 1)[0]
+    mp3_path = base + ".mp3"
     if not os.path.exists(mp3_path):
         mp3s = [os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.lower().endswith(".mp3")]
         if mp3s:
             mp3_path = max(mp3s, key=os.path.getmtime)
-    return mp3_path, title
+    video_path = ydl.prepare_filename(info)
+    if not os.path.exists(video_path):
+        video_path = None
+    return mp3_path, video_path, title
 
 
 class _ProgressLogger:
@@ -360,6 +542,188 @@ class _ProgressLogger:
 
     def error(self, msg):
         pass
+
+
+def extract_douyin_video(url, out_dir, progress_cb):
+    """
+    抖音视频提取 (yt-dlp 无法处理抖音签名, 用 CDP 控制 Chrome 从页面读取视频地址)
+    方案移植自 soundferry 的 douyin.js
+    返回 (mp3_path, title)
+    """
+    chrome = shutil.which("google-chrome") or shutil.which("chromium")
+    if not chrome:
+        raise RuntimeError("未找到 Chrome，抖音提取需要 Chrome")
+
+    chrome_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+    # 申请空闲端口
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+
+    profile = tempfile.mkdtemp(prefix="chrome-douyin-")
+    proc = subprocess.Popen([
+        chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
+        "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled",
+        "--disable-features=Translate,BackForwardCache,AcceptCHFrame",
+        "--no-first-run", "--no-default-browser-check", "--mute-audio",
+        "--window-size=1280,800",
+        "--remote-allow-origins=*",
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile}",
+        "about:blank",
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def cdp_send(ws, method, params=None, timeout=20):
+        msg_id = int(time.time() * 1000) % 1000000
+        ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ws.settimeout(max(0.1, deadline - time.time()))
+            try:
+                data = json.loads(ws.recv())
+            except Exception:
+                break
+            if data.get("id") == msg_id:
+                return data.get("result", {})
+        return {}
+
+    READ_STATE = (
+        "(() => {"
+        "const vids = Array.from(document.querySelectorAll('video'));"
+        "const v = vids.find(x => (x.currentSrc || x.src || '').startsWith('http'));"
+        "return JSON.stringify({"
+        "src: v ? (v.currentSrc || v.src) : '',"
+        "title: document.title || '',"
+        "duration: v && isFinite(v.duration) ? Math.round(v.duration) : 0,"
+        "ready: document.readyState"
+        "});"
+        "})()"
+    )
+
+    try:
+        # 等待 CDP 就绪
+        ready = False
+        for _ in range(30):
+            try:
+                requests.get(f"http://127.0.0.1:{port}/json/version", timeout=2)
+                ready = True
+                break
+            except Exception:
+                time.sleep(0.5)
+        if not ready:
+            raise RuntimeError("Chrome CDP 启动失败")
+
+        progress_cb(3, "抖音页面加载中…")
+        targets = requests.get(f"http://127.0.0.1:{port}/json/list", timeout=5).json()
+        page = next((t for t in targets if t.get("type") == "page"), None)
+        if not page:
+            raise RuntimeError("未找到页面 target")
+        ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=15)
+
+        cdp_send(ws, "Page.enable")
+        cdp_send(ws, "Runtime.enable")
+        cdp_send(ws, "Page.navigate", {"url": url})
+
+        video_url = ""
+        title = ""
+        deadline = time.time() + 40
+        nudged = 0
+        while time.time() < deadline:
+            res = cdp_send(ws, "Runtime.evaluate",
+                           {"expression": READ_STATE, "returnByValue": True})
+            try:
+                state = json.loads(res.get("result", {}).get("value", "{}"))
+            except Exception:
+                state = {}
+            if state.get("src", "").startswith("http"):
+                video_url = state["src"]
+                title = state.get("title", "")
+                break
+            # 推动播放器挂载真实流地址
+            if nudged < 2 and time.time() > deadline - 35 + nudged * 8:
+                nudged += 1
+                cdp_send(ws, "Runtime.evaluate", {"expression": (
+                    "(() => {"
+                    "const v = document.querySelector('video');"
+                    "if (v) { try { v.muted = true; v.play(); } catch(e){} }"
+                    "const btn = document.querySelector('[data-e2e=\"video-play\"]');"
+                    "if (btn) { try { btn.click(); } catch(e){} }"
+                    "return 'ok';"
+                    "})()"
+                ), "returnByValue": True})
+            time.sleep(0.7)
+
+        if not video_url:
+            ws.close()
+            raise RuntimeError("未获取到抖音视频地址（页面可能需要验证，请在 Chrome 中打开该链接后重试）")
+
+        progress_cb(8, "视频地址已获取，下载中…")
+        # 直接下载视频直链 (抖音 CDN 校验 UA/Referer; 偶发返回极小占位内容需重读 src 重试)
+        tmp_mp4 = os.path.join(out_dir, "douyin_tmp.mp4")
+        headers = {
+            "User-Agent": chrome_ua,
+            "Referer": "https://www.douyin.com/",
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        video_url_cur = video_url
+        ok = False
+        for attempt in range(3):
+            try:
+                with requests.get(video_url_cur, headers=headers, stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    total = 0
+                    with open(tmp_mp4, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1 << 20):
+                            if chunk:
+                                f.write(chunk)
+                                total += len(chunk)
+                                progress_cb(min(8 + int(total / 5e6), 20), "下载中…")
+                if total < 500 * 1024:
+                    raise RuntimeError(f"抖音 CDN 返回占位内容 ({total} 字节), 重新获取地址")
+                ok = True
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                # 重新读取 video src (签名地址可能已轮换)
+                res = cdp_send(ws, "Runtime.evaluate",
+                               {"expression": READ_STATE, "returnByValue": True})
+                try:
+                    state = json.loads(res.get("result", {}).get("value", "{}"))
+                except Exception:
+                    state = {}
+                if state.get("src", "").startswith("http"):
+                    video_url_cur = state["src"]
+                time.sleep(1)
+        ws.close()
+
+        if not ok:
+            raise RuntimeError("抖音视频下载失败")
+
+        # ffmpeg 转 MP3
+        progress_cb(22, "转码 MP3 中…")
+        title = (title or "").replace(" - 抖音", "").strip() or "抖音音频"
+        mp3_name = title[:60].replace(os.sep, "_").replace("/", "_")
+        mp3_path = os.path.join(out_dir, mp3_name + ".mp3")
+        cmd = ["ffmpeg", "-y", "-i", tmp_mp4, "-vn", "-c:a", "libmp3lame", "-q:a", "2", mp3_path]
+        ffmpeg_proc = subprocess.run(cmd, capture_output=True)
+        if ffmpeg_proc.returncode != 0:
+            stderr = ffmpeg_proc.stderr.decode("utf-8", errors="replace")
+            os.remove(tmp_mp4)
+            raise RuntimeError(f"ffmpeg 转码失败: {stderr[-300:]}")
+        os.remove(tmp_mp4)
+        return mp3_path, title
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+        shutil.rmtree(profile, ignore_errors=True)
 
 
 def split_audio(mp3_path, parts_dir, progress_cb):
@@ -481,10 +845,45 @@ def run_pipeline(task_id, url, prompt_name, mode="transcribe"):
                 mp3_basename = mp3.stem if mp3 else transcript_path.stem.replace(".transcript", "")
                 update_task(task_id, title=load_title(work))
             else:
-                # 下载音频
-                update_task(task_id, status="downloading", stage="下载音频", progress=2, message="开始下载…")
-                mp3_path, title = download_audio(url, str(work),
-                                                 lambda p, m: update_task(task_id, progress=p, message=m))
+                if mode == "upload":
+                    # 上传模式: 文件已保存到任务目录; 非 mp3 先提取/转码
+                    mp3_path = find_mp3(work)
+                    if not mp3_path:
+                        src = find_upload_source(work)
+                        if not src:
+                            raise RuntimeError("上传的音频/视频文件不存在, 请重新上传")
+                        is_video = src.suffix.lower() in VIDEO_EXTS and has_video_stream(src)
+                        update_task(task_id, status="extracting", stage="提取音频",
+                                    progress=2, message="ffmpeg 提取音频中…")
+                        mp3_path = work / (src.stem + ".mp3")
+                        convert_audio(src, mp3_path)
+                        # 视频源: 删除前提取关键帧
+                        if is_video:
+                            update_task(task_id, status="extracting_frames", stage="提取关键帧",
+                                        progress=41, message="ffmpeg 场景检测中…")
+                            extract_keyframes(src, work / "frames",
+                                              lambda p, m: update_task(task_id, progress=p, message=m))
+                        src.unlink(missing_ok=True)  # 处理完成, 删除源文件节省空间
+                        update_task(task_id, progress=44, message="音频提取完成")
+                    title = mp3_path.stem
+                else:
+                    # 下载视频+音频
+                    update_task(task_id, status="downloading", stage="下载视频", progress=2, message="开始下载…")
+                    if "douyin.com" in url:
+                        # 抖音: yt-dlp 无法处理签名, 用 CDP 控制 Chrome 从页面提取
+                        mp3_path, title = extract_douyin_video(url, str(work),
+                                                              lambda p, m: update_task(task_id, progress=p, message=m))
+                        video_path = None
+                    else:
+                        mp3_path, video_path, title = download_media(url, str(work),
+                                                                     lambda p, m: update_task(task_id, progress=p, message=m))
+                        # 提取关键帧 (随后删除视频文件节省空间)
+                        if video_path and os.path.exists(video_path):
+                            update_task(task_id, status="extracting_frames", stage="提取关键帧", progress=41,
+                                        message="ffmpeg 场景检测中…")
+                            extract_keyframes(video_path, work / "frames",
+                                              lambda p, m: update_task(task_id, progress=p, message=m))
+                            os.remove(video_path)
                 mp3_basename = Path(mp3_path).stem
                 update_task(task_id, title=title)
                 (work / "title.txt").write_text(title, encoding="utf-8")
@@ -547,15 +946,19 @@ def run_pipeline(task_id, url, prompt_name, mode="transcribe"):
 # ---------------- 导出 ----------------
 
 def get_export_files(task_id):
-    """列出任务下可导出的文件 (mp3 / transcript / tutorial)"""
+    """列出任务下可导出的文件 (mp3 / transcript / tutorial / 关键帧)"""
     work = WORK_DIR / task_id
     files = []
     if not work.exists():
         return files
     for p in sorted(work.iterdir()):
         if (p.is_file() and p.suffix in (".mp3", ".txt", ".md")
-                and p.name not in ("prompt_used.txt", "title.txt")):
+                and p.name not in ("prompt_used.txt", "title.txt", "upload_source.txt")):
             files.append({"name": p.name, "size": p.stat().st_size})
+    frames_dir = work / "frames"
+    if frames_dir.exists():
+        for p in sorted(frames_dir.glob("kf_*.jpg")):
+            files.append({"name": f"frames/{p.name}", "size": p.stat().st_size})
     return files
 
 
@@ -606,6 +1009,57 @@ def api_generate(req: GenerateRequest):
     return {"task_id": task_id}
 
 
+@app.post("/api/upload")
+async def api_upload(file: UploadFile = File(...), prompt: str = Form("")):
+    """独立上传音视频文件 → 提取音频 → 切分转录 → (用户确认后) 生成教程"""
+    filename = safe_filename(file.filename)
+    ext = Path(filename).suffix.lower()
+    if ext not in (AUDIO_EXTS | VIDEO_EXTS):
+        raise HTTPException(400, f"不支持的文件类型 {ext or '(无扩展名)'}，请上传音频 (mp3 / m4a / wav) 或视频 (mp4 / mkv / avi) 文件")
+
+    # 流式保存 + 计算内容 md5 (同一文件内容 → 同一任务, 复用转录/教程缓存)
+    tmp_dir = WORK_DIR / ".upload_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / f"upload_{time.time_ns()}{ext}"
+    digest = hashlib.md5()
+    size = 0
+    try:
+        with open(tmp_path, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > UPLOAD_MAX_MB * 1024 * 1024:
+                    raise HTTPException(413, f"文件超过 {UPLOAD_MAX_MB}MB 限制")
+                digest.update(chunk)
+                out.write(chunk)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    file_md5 = digest.hexdigest()
+
+    task_id, reused = register_upload_task(file_md5, filename)
+    if reused:
+        # 同一文件内容已登记过, 复用已有任务 (转录/教程不重复做)
+        tmp_path.unlink(missing_ok=True)
+    else:
+        # 保存到任务目录 (音视频提取在流水线线程中进行, 避免阻塞请求)
+        work = WORK_DIR / task_id
+        work.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(tmp_path), str(work / filename))
+        (work / "upload_source.txt").write_text(filename, encoding="utf-8")
+
+    prompt_name = (prompt or "").strip() or DEFAULT_PROMPT
+    resolve_prompt(prompt_name)
+    with TASKS_LOCK:
+        existing = TASKS.get(task_id)
+        if existing and existing["status"] not in ("error",):
+            return {"task_id": task_id, "reused": "task_exists"}
+        TASKS[task_id] = {"status": "queued", "stage": "排队中", "progress": 0,
+                          "message": "任务已创建", "url": "", "filename": filename}
+    threading.Thread(target=run_pipeline, args=(task_id, "", prompt_name, "upload"),
+                     daemon=True).start()
+    return {"task_id": task_id}
+
+
 @app.post("/api/regenerate")
 def api_regenerate(req: RegenerateRequest):
     """继续/重新生成教程: 读取已有 transcript, 只调用 LLM 生成教程"""
@@ -630,6 +1084,31 @@ def api_regenerate(req: RegenerateRequest):
 def api_files(task_id: str):
     """列出任务下可导出的文件"""
     return {"files": get_export_files(task_id)}
+
+
+@app.get("/api/keyframes/{task_id}")
+def api_keyframes(task_id: str, count: int = 0):
+    """列出关键帧; 传 count 时返回按时间平均间隔选取的子集"""
+    work = WORK_DIR / task_id
+    kf_file = work / "frames" / "keyframes.json"
+    if not kf_file.exists():
+        return {"frames": [], "total": 0}
+    frames = json.loads(kf_file.read_text(encoding="utf-8"))
+    total = len(frames)
+    if count and 0 < count < total:
+        frames = select_even_frames(frames, count)
+    return {"frames": frames, "total": total}
+
+
+@app.get("/api/keyframes/{task_id}/file/{filename}")
+def api_keyframe_file(task_id: str, filename: str):
+    """返回关键帧图片"""
+    work = (WORK_DIR / task_id).resolve()
+    frames_dir = (work / "frames").resolve()
+    p = (frames_dir / filename).resolve()
+    if not str(p).startswith(str(frames_dir)) or not p.is_file():
+        raise HTTPException(404, "关键帧不存在")
+    return FileResponse(p, media_type="image/jpeg")
 
 
 @app.get("/api/download/{task_id}/{filename}")
@@ -731,6 +1210,10 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
     WORK_DIR.mkdir(parents=True, exist_ok=True)
+    # 将 deno 加入 PATH (YouTube JS 挑战求解需要)
+    deno_bin = Path.home() / ".deno" / "bin"
+    if deno_bin.exists() and str(deno_bin) not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = str(deno_bin) + os.pathsep + os.environ.get("PATH", "")
     migrate_legacy_tasks()
     print(f"服务启动: http://{args.host}:{args.port}")
     import uvicorn

@@ -16,5 +16,50 @@
     ],
     "created": "2026-11-03 15:49:44",
     "last_used": "2026-11-03 17:22:35"
+  },
+  "https://www.douyin.com/video/7703886324687719723?previous_page=app_code_link": {
+    "key": "https://www.douyin.com/video/7703886324687719723?previous_page=app_code_link",
+    "task_id": "7238d725b9c5",
+    "urls": [
+      "https://www.douyin.com/video/7703886324687719723?previous_page=app_code_link"
+    ],
+    "created": "2026-11-04 15:25:21",
+    "last_used": "2026-11-04 16:04:47"
+  },
+  "upload:77d6528d5647e176e10440c740a5d868": {
+    "key": "upload:77d6528d5647e176e10440c740a5d868",
+    "task_id": "aeb0375852d0",
+    "urls": [],
+    "filename": "audio.m4a",
+    "type": "upload",
+    "created": "2026-11-04 15:50:42",
+    "last_used": "2026-11-04 15:50:42"
+  },
+  "youtube:dQw4w9WgXcQ": {
+    "key": "youtube:dQw4w9WgXcQ",
+    "task_id": "2833c609b9b6",
+    "urls": [
+      "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    ],
+    "created": "2026-11-04 15:59:27",
+    "last_used": "2026-11-04 15:59:27"
+  },
+  "https://www.douyin.com/video/7703886324687719723": {
+    "key": "https://www.douyin.com/video/7703886324687719723",
+    "task_id": "fe57ca5e7e9a",
+    "urls": [
+      "https://www.douyin.com/video/7703886324687719723"
+    ],
+    "created": "2026-11-04 16:12:00",
+    "last_used": "2026-11-04 17:35:01"
+  },
+  "upload:2984deb21b8302c0afb1ce005241888e": {
+    "key": "upload:2984deb21b8302c0afb1ce005241888e",
+    "task_id": "251c3e363565",
+    "urls": [],
+    "filename": "douyin_video.mp4",
+    "type": "upload",
+    "created": "2026-11-04 17:32:16",
+    "last_used": "2026-11-04 18:11:32"
   }
 }
